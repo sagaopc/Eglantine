@@ -289,6 +289,7 @@ public:
     Id viewport_index{};
     Id viewport_mask{};
     Id primitive_id{};
+    Id primitive_id_out{};
 
     Id fswzadd_lut_a{};
     Id fswzadd_lut_b{};

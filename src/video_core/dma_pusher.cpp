@@ -109,7 +109,36 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                // Parameters continued in an entry of their own can be arguments the GPU wrote
+                // (Donkey Kong Bananza's terrain: the culling pass counts each mesh's triangles
+                // into a 5-word indirect draw record and the colour pass draws with it). Read
+                // without a flush, the macro sees the older guest words (a zero count, so the
+                // terrain is never drawn). EDEN_NX2_PBFLUSH=0 turns this off. From Franseven's
+                // PokeDinner fork (1.5.0).
+                static const bool flush_parameters = [] {
+                    const char* value = std::getenv("EDEN_NX2_PBFLUSH");
+                    return value == nullptr || value[0] != '0';
+                }();
+                bool flushed_parameters = false;
+                if (flush_parameters && words <= 64) {
+                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                        split.Drain();
+                    }
+                    const GPUVAddr address = dma_state.dma_get;
+                    const size_t bytes = words * sizeof(u32);
+                    if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory_manager.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
+                        flushed_parameters = true;
+                        static std::atomic<u32> flush_logs{};
+                        if (flush_logs.fetch_add(1) < 20) {
+                            LOG_INFO(HW_GPU, "Macro parameters at {:#x} ({} words) were written by the GPU: flushed",
+                                     address, words);
+                        }
+                    }
+                }
+                if (flushed_parameters) {
+                    engine_state->current_dirty = false;
+                } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -155,14 +184,31 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (use_safe) {
+        const size_t entry_bytes = size_t{header.size} * sizeof(u32);
+        const bool gpu_written = HasGpuWrittenCommands(dma_state.dma_get, entry_bytes);
+        // The words as submitted, unless this is a resumed entry, the GPU writes these words
+        // itself (they are only current in memory), or it has newer ones the safe read below
+        // would flush.
+        const bool submitted = command_resume_offset == 0 && !gpu_written &&
+                               dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get, entry_bytes));
+        if (submitted) {
+            const std::span<const CommandHeader> commands{
+                command_list.submitted_words.data() +
+                    command_list.submitted_offsets[dma_pushbuffer_subindex],
+                header.size};
+            RecordParsedEntry(header, commands);
+            command_resume_offset += ProcessCommands(commands, 0);
+        } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            if (gpu_written) {
+                FlushGpuWrittenCommands(dma_state.dma_get, entry_bytes);
+            }
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -446,22 +492,24 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+bool DmaPusher::HasGpuWrittenCommands(GPUVAddr address, size_t size) const {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return false;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page);
+            device && Tegra::Nx2IsGpuWritten(*device)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
     // mode reads every command list through the caches (safe reads); here only the ones on pages
     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
-    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
-        return;
-    }
-    bool written = false;
-    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
-        if (const auto device = memory_manager.GpuToCpuAddress(page);
-            device && Tegra::Nx2IsGpuWritten(*device)) {
-            written = true;
-            break;
-        }
-    }
-    if (!written) {
+    if (!HasGpuWrittenCommands(address, size)) {
         return;
     }
     // The caches belong to the split's back: it first runs what the front queued (the dispatch

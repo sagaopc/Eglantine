@@ -595,6 +595,15 @@ std::atomic<u32> g_nx2_trace_draws_after_upscale{};
 // images of the same format and the output is larger: title 4's slots first, else the first two
 // handles in cbuf0+0x80..0x11c that form such a pair.
 bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+    // EDEN_NX2_NO_TENSOR_UPSCALE=1: skip the program as any other rejected one. The input and
+    // output guess picks the wrong images in some titles (a whole frame of a normal buffer).
+    if (static const bool disabled = [] {
+            const char* value = std::getenv("EDEN_NX2_NO_TENSOR_UPSCALE");
+            return value && *value && *value != '0';
+        }();
+        disabled) {
+        return false;
+    }
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
     const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {

@@ -569,6 +569,65 @@ void ConvertLegacyToGeneric(IR::Program& program, const Shader::RuntimeInfo& run
     }
 }
 
+u32 ForwardPassthroughGeometryState(IR::Program& source, IR::Program& geometry,
+                                    const IR::Program* fragment) {
+    if (!geometry.is_geometry_passthrough || geometry.blocks.empty() || source.blocks.empty()) {
+        return 0;
+    }
+    IR::Block& entry{*geometry.blocks.front()};
+    u32 forwarded{};
+    const std::array<IR::Attribute, 2> state{IR::Attribute::Layer, IR::Attribute::ViewportIndex};
+    for (size_t kind = 0; kind < state.size(); ++kind) {
+        const IR::Attribute attribute{state[kind]};
+        if (!source.info.stores[attribute] || geometry.info.stores[attribute]) {
+            continue;
+        }
+        std::optional<u32> free_generic;
+        for (u32 index = 0; index < IR::NUM_GENERICS && !free_generic; ++index) {
+            if (!source.info.stores.Generic(index) &&
+                !(fragment && fragment->info.loads.Generic(index))) {
+                free_generic = index;
+            }
+        }
+        if (!free_generic) {
+            continue;
+        }
+        const IR::Attribute carrier{IR::Attribute::Generic0X + *free_generic * 4};
+        std::vector<std::pair<IR::Block*, IR::Inst*>> stores;
+        for (IR::Block* const block : source.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::SetAttribute &&
+                    inst.Arg(0).Attribute() == attribute) {
+                    stores.emplace_back(block, &inst);
+                }
+            }
+        }
+        if (stores.empty()) {
+            continue;
+        }
+        for (const auto& [block, inst] : stores) {
+            IR::IREmitter ir{*block, std::next(IR::Block::InstructionList::s_iterator_to(*inst))};
+            ir.SetAttribute(carrier, IR::F32{inst->Arg(1)}, IR::U32{inst->Arg(2)});
+        }
+        source.info.stores.Set(carrier, true);
+        IR::IREmitter ir{entry, entry.begin()};
+        ir.SetAttribute(attribute, ir.GetAttribute(carrier, ir.Imm32(0)), ir.Imm32(0));
+        geometry.info.loads.Set(carrier, true);
+        geometry.info.stores.Set(attribute, true);
+        forwarded |= 1U << kind;
+    }
+    if (fragment && fragment->info.loads[IR::Attribute::PrimitiveId] &&
+        !geometry.info.stores[IR::Attribute::PrimitiveId]) {
+        IR::IREmitter ir{entry, entry.begin()};
+        ir.SetAttribute(IR::Attribute::PrimitiveId, ir.GetAttribute(IR::Attribute::PrimitiveId),
+                        ir.Imm32(0));
+        geometry.info.loads.Set(IR::Attribute::PrimitiveId, true);
+        geometry.info.stores.Set(IR::Attribute::PrimitiveId, true);
+        forwarded |= 4;
+    }
+    return forwarded;
+}
+
 IR::Program GenerateGeometryPassthrough(ObjectPool<IR::Inst>& inst_pool,
                                         ObjectPool<IR::Block>& block_pool,
                                         const HostTranslateInfo& host_info,

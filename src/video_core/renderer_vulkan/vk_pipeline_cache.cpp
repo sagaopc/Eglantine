@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <fstream>
@@ -1114,6 +1115,38 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
+        }
+    }
+    if (key.unique_hashes[4] != 0 && programs[4].is_geometry_passthrough &&
+        host_info.support_geometry_shader_passthrough) {
+        size_t source_index = 3;
+        while (source_index > 0 && key.unique_hashes[source_index] == 0) {
+            --source_index;
+        }
+        auto& source{programs[source_index]};
+        const auto* fragment{key.unique_hashes[5] != 0 ? &programs[5] : nullptr};
+        const bool layer{source.info.stores[Shader::IR::Attribute::Layer]};
+        const bool viewport{source.info.stores[Shader::IR::Attribute::ViewportIndex]};
+        const bool clip{source.info.stores.ClipDistances()};
+        const u32 forwarded{Shader::Maxwell::ForwardPassthroughGeometryState(source, programs[4],
+                                                                             fragment)};
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 24) {
+            u32 source_generics{}, fragment_generics{};
+            for (u32 generic = 0; generic < Shader::IR::NUM_GENERICS; ++generic) {
+                source_generics |= u32{source.info.stores.Generic(generic)} << generic;
+                if (fragment) {
+                    fragment_generics |= u32{fragment->info.loads.Generic(generic)} << generic;
+                }
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Passthrough geometry pipeline {:016x} (vs {:016x} gs {:016x} fs {:016x}): "
+                     "source writes layer {} viewport {} clip {} generics {:08x}; fragment "
+                     "reads primitive id {} generics {:08x}; forwarded {:x}",
+                     hash, key.unique_hashes[source_index], key.unique_hashes[4],
+                     key.unique_hashes[5], layer, viewport, clip, source_generics,
+                     fragment && fragment->info.loads[Shader::IR::Attribute::PrimitiveId],
+                     fragment_generics, forwarded);
         }
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};

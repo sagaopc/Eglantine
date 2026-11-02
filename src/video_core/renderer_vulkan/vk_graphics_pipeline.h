@@ -87,6 +87,7 @@ public:
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    const GraphicsPipelineCacheKey& Key() const noexcept { return key; }
     bool SupportsAlphaToCoverage() const noexcept {
         return fragment_has_color0_output;
     }

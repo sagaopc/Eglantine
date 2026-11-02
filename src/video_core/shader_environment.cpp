@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -323,7 +325,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     return entry;
 }
 
-void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
+void GenericEnvironment::InitializeNativeCode(u32 source_header_size, bool geometry) {
     using Shader::Ampere::Instruction;
     const u32 native_header_size = source_header_size;
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
@@ -355,7 +357,13 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    // EDEN_NX2_GS_NO_CULL=1: native geometry programs keep every primitive (no viewport mask).
+    static const bool keep_all_primitives = [] {
+        const char* value = std::getenv("EDEN_NX2_GS_NO_CULL");
+        return value && *value && *value != '0';
+    }();
+    auto lowered = Shader::Ampere::LowerToMaxwell(
+        native, {.geometry = geometry, .keep_all_primitives = geometry && keep_all_primitives});
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -432,6 +440,26 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
             }
         }
     }
+    if (!lowered && geometry) {
+        // Native geometry programs are new: log a few whole so the next unsupported form can be
+        // read from a user's log.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 4) {
+            std::array<u32, 5> header{};
+            std::memcpy(header.data(), &sph, sizeof(header));
+            LOG_ERROR(Shader, "Native geometry program at {:#x} ({} instructions, header {:08x}):",
+                      program_base, native.size(), fmt::join(header, " "));
+            for (size_t i = 0; i < std::min<size_t>(native.size(), 512); i += 4) {
+                const size_t end = std::min(native.size(), i + 4);
+                std::string line;
+                for (size_t j = i; j < end; ++j) {
+                    line += fmt::format(" {:08x}{:08x}{:08x}{:08x}", native[j].words[3], native[j].words[2],
+                                        native[j].words[1], native[j].words[0]);
+                }
+                LOG_ERROR(Shader, "  +{:04x}:{}", i * sizeof(Shader::Ampere::Instruction), line);
+            }
+        }
+    }
     if (!lowered) {
         const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
         const auto words = failed < native.size() ? native[failed].words : std::array<u32, 4>{};
@@ -479,9 +507,19 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                          (program == Maxwell::ShaderType::VertexB ||
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
+        const bool geometry{program == Maxwell::ShaderType::Geometry};
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            !mesh_slot) {
+            !geometry && !mesh_slot) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
+        }
+        // EDEN_NX2_NO_GEOMETRY=1 rejects native geometry programs again (their draws are skipped).
+        static const bool no_geometry = std::getenv("EDEN_NX2_NO_GEOMETRY") != nullptr;
+        if (geometry && no_geometry) {
+            throw Shader::RuntimeError("Native geometry programs disabled by EDEN_NX2_NO_GEOMETRY");
+        }
+        if (geometry && sph.common0.shader_type != 4) {
+            throw Shader::RuntimeError("Unsupported native geometry header (type {})",
+                                       sph.common0.shader_type.Value());
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
             const u32 native_stage = program == Maxwell::ShaderType::Pixel ? 4 : 0;
@@ -493,9 +531,19 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         }
-        InitializeNativeCode();
+        InitializeNativeCode(128, geometry);
     }
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
+    if (native && program == Maxwell::ShaderType::Geometry) {
+        // Only the position and generic attributes (28-159) pass through a native geometry
+        // program: the skip mask may be unset here, and system values such as the instance id
+        // are no geometry inputs (passing them made invalid SPIR-V).
+        for (u32 attribute = 0; attribute < 256; ++attribute) {
+            if (attribute < 28 || attribute >= 160) {
+                gp_passthrough_mask[attribute / 32] |= 1U << (attribute % 32);
+            }
+        }
+    }
     switch (program) {
     case Maxwell::ShaderType::VertexA:
         stage = Shader::Stage::VertexA;

@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <tuple>
 #include <set>
+#include <unordered_map>
+#include <vector>
 #include <fstream>
 #include <mutex>
 
@@ -241,6 +243,112 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+// EDEN_NX2_TRACE_SHADERS=<hash>,...: log the draws of pipelines holding one of these shaders (their
+// unique hashes, as the pipeline log prints them): the draw, its depth and color state and, for a
+// geometry stage, the storage addresses its constant buffer 0 holds at 0x410 and 0x420.
+void RasterizerVulkan::TraceShaderDraw(const GraphicsPipeline& pipeline) {
+    static const std::vector<u64> traced = [] {
+        std::vector<u64> hashes;
+        if (const char* text = std::getenv("EDEN_NX2_TRACE_SHADERS")) {
+            for (const char* cursor = text; *cursor;) {
+                char* end{};
+                const u64 hash = std::strtoull(cursor, &end, 16);
+                if (end == cursor) break;
+                hashes.push_back(hash);
+                cursor = *end ? end + 1 : end;
+            }
+        }
+        return hashes;
+    }();
+    if (traced.empty()) {
+        return;
+    }
+    const auto& hashes = pipeline.Key().unique_hashes;
+    if (std::none_of(hashes.begin(), hashes.end(), [](u64 hash) {
+            return hash && std::find(traced.begin(), traced.end(), hash) != traced.end();
+        })) {
+        return;
+    }
+    static std::unordered_map<u64, u64> draws;
+    const u64 count = draws[pipeline.Key().Hash()]++;
+    if (count >= 8 && count % 2000 != 0) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& indirect = maxwell3d->draw_manager.indirect_state;
+    u64 gs_counter{}, gs_output{};
+    const auto& gs_cbuf = maxwell3d->state.shader_stages[3].const_buffers[0];
+    if (hashes[4] && gs_cbuf.enabled && gpu_memory->IsFullyMappedRange(gs_cbuf.address + 0x410, 0x18)) {
+        gs_counter = gpu_memory->Read<u64>(gs_cbuf.address + 0x410);
+        gs_output = gpu_memory->Read<u64>(gs_cbuf.address + 0x420);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Trace draw #{} vs {:016x} gs {:016x} fs {:016x}: {} indexed {} topology {} vertices "
+             "{}+{} indices {}+{} at {:#x} format {} base {} instances {}+{}; indirect {:#x} count "
+             "{:#x} include {} max {} stride {}; depth test {} write {} func {:#x} stencil {}; "
+             "rt {:#x} {:#x} {:#x} masks {:x} {:x} {:x} zeta {:#x}; vb0 {:#x}; gs counter {:#x} "
+             "output {:#x}",
+             count, hashes[1], hashes[4], hashes[5], in_indirect_draw ? "indirect" : "direct",
+             draw.draw_indexed, static_cast<u32>(draw.topology), draw.vertex_buffer.first,
+             draw.vertex_buffer.count, draw.index_buffer.first, draw.index_buffer.count,
+             draw.index_buffer.StartAddress(), static_cast<u32>(draw.index_buffer.format),
+             draw.base_index, draw.base_instance, draw.instance_count,
+             indirect.indirect_start_address, indirect.count_start_address, indirect.include_count,
+             indirect.max_draw_counts, indirect.stride, regs.depth_test_enable,
+             regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func), regs.stencil_enable,
+             regs.rt[0].Address(), regs.rt[1].Address(), regs.rt[2].Address(),
+             regs.color_mask[0].raw, regs.color_mask[1].raw, regs.color_mask[2].raw,
+             regs.zeta.Address(), regs.vertex_streams[0].Address(), gs_counter, gs_output);
+    if (count >= 2) {
+        return;
+    }
+    // The bindless textures the stages read through constant buffer 2 (0x20-0x9c): their
+    // contents after a download, as the share of zero bytes and a byte average.
+    static std::set<GPUVAddr> described;
+    for (const u32 stage : {0U, 4U}) {
+        const auto& textures = maxwell3d->state.shader_stages[stage].const_buffers[2];
+        if (!textures.enabled || !gpu_memory->IsFullyMappedRange(textures.address + 0x20, 0x80)) {
+            continue;
+        }
+        for (u32 offset = 0x20; offset < 0xa0; offset += 8) {
+            const u32 handle = gpu_memory->Read<u32>(textures.address + offset);
+            const u32 tic_index = handle & 0xfffff;
+            if (handle == 0 || tic_index > regs.tex_header.limit) {
+                continue;
+            }
+            Tegra::Texture::TICEntry tic{};
+            gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{tic_index} * sizeof(tic),
+                                        &tic, sizeof(tic));
+            const GPUVAddr address = tic.Address();
+            if (address == 0 || !described.insert(address).second) {
+                continue;
+            }
+            const u64 size = std::min<u64>(u64{tic.Width()} * tic.Height() * 4, 4ULL << 20);
+            if (!gpu_memory->IsFullyMappedRange(address, size)) {
+                continue;
+            }
+            if (const auto device_address = gpu_memory->GpuToCpuAddress(address)) {
+                FlushRegion(*device_address, size, VideoCommon::CacheType::All);
+            }
+            std::vector<u8> bytes(size);
+            gpu_memory->ReadBlockUnsafe(address, bytes.data(), bytes.size());
+            const u64 zeros = static_cast<u64>(std::count(bytes.begin(), bytes.end(), u8{0}));
+            u64 sum{};
+            for (const u8 byte : bytes) {
+                sum += byte;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "  {} texture @cb2+{:#x} handle {:#x}: tic {} {:#x} {}x{}x{} type {} format "
+                     "{:#x} srgb {}: {}% zero bytes, average {} (of {} bytes)",
+                     stage == 0 ? "vs" : "fs", offset, handle, tic_index, address, tic.Width(),
+                     tic.Height(), tic.Depth(), static_cast<u32>(tic.texture_type.Value()),
+                     static_cast<u32>(tic.format.Value()), static_cast<u32>(tic.srgb_conversion.Value()),
+                     zeros * 100 / size, sum / size, size);
+        }
+    }
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
@@ -272,6 +380,83 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
+    // Before the pipeline (the program's stores are lost, so it needs none) and the cache locks
+    // (the record writes and the list flush take them themselves).
+    // Donkey Kong Bananza's terrain: a GPU program run over points resets each rock/dirt piece's
+    // 5-word indirect draw record ({triangles 0, copies 1, 0, 0, 0}) through the pointers in a list
+    // (c0[0x110]). Stores through addresses loaded from memory can't be mapped onto a storage
+    // buffer, so the recompiler loses them and every record keeps 0 copies -- and a draw of 0
+    // copies draws nothing. Do that program's stores here instead. EDEN_NX2_RESETFIX=0 leaves it
+    // to the GPU.
+    static const bool reset_fix = [] {
+        const char* value = std::getenv("EDEN_NX2_RESETFIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (reset_fix && !is_indexed && maxwell3d->GetNativeMacroEngine().native_turing) {
+        // The program's 11 native instructions.
+        static constexpr std::array<u32, 44> NX2_INDIRECT_RESET_PROGRAM{
+            0xff007321, 0x0002fcff, 0x00000000, 0x000e2400, 0x00007a11, 0x00004400, 0x078018ff,
+            0x001fca00, 0xff017624, 0x00004500, 0x000e06ff, 0x000fcc00, 0x00007381, 0x00000000,
+            0x001eab00, 0x000ea200, 0x00037802, 0x00000001, 0x00000f00, 0x000fca00, 0x00007386,
+            0x00000403, 0x0010a900, 0x004fe800, 0x00007386, 0x000000ff, 0x0010a900, 0x000fe800,
+            0x00007386, 0x000008ff, 0x0010a900, 0x000fe800, 0x00007386, 0x00000cff, 0x0010a900,
+            0x000fe800, 0x00007386, 0x000010ff, 0x0010a900, 0x000fe200, 0x0000794d, 0x00000000,
+            0x03800000, 0x000fea00,
+        };
+        const auto& reset_regs = maxwell3d->regs;
+        const GPUVAddr program =
+            (u64{reset_regs.pipelines[1].reserved[0] & 0xff} << 32) | reset_regs.pipelines[1].reserved[1];
+        static std::unordered_map<GPUVAddr, bool> reset_programs;
+        auto [entry, inserted] = reset_programs.try_emplace(program, false);
+        if (inserted) {
+            std::array<u32, 44> code{};
+            const GPUVAddr code_address = program + 128;
+            if (gpu_memory->IsFullyMappedRange(code_address, sizeof(code))) {
+                gpu_memory->ReadBlockUnsafe(code_address, code.data(), sizeof(code));
+                entry->second = code == NX2_INDIRECT_RESET_PROGRAM;
+            }
+            if (entry->second) {
+                LOG_INFO(HW_GPU, "Indirect draw reset program at {:#x}: its stores are done here",
+                         program);
+            }
+        }
+        if (entry->second) {
+            const auto& reset_draw = maxwell3d->draw_manager.draw_state;
+            const auto& cbuf0 = maxwell3d->state.shader_stages[0].const_buffers[0];
+            const GPUVAddr list = gpu_memory->Read<u64>(cbuf0.address + 0x110);
+            const u32 count = (std::min)(reset_draw.vertex_buffer.count, 1u << 20);
+            const GPUVAddr list_begin = list + u64{reset_draw.vertex_buffer.first} * sizeof(u64);
+            const size_t list_bytes = size_t{count} * sizeof(u64);
+            if (count != 0 && gpu_memory->IsFullyMappedRange(list_begin, list_bytes)) {
+                if (gpu_memory->IsMemoryDirty(list_begin, list_bytes,
+                                              VideoCommon::CacheType::BufferCache)) {
+                    gpu_memory->FlushRegion(list_begin, list_bytes,
+                                            VideoCommon::CacheType::BufferCache);
+                }
+                std::vector<u64> pointers(count);
+                gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
+                static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+                const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()),
+                                                sizeof(record)};
+                u32 written = 0;
+                for (const u64 pointer : pointers) {
+                    if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+                        continue;
+                    }
+                    AccelerateInlineToMemory(pointer, sizeof(record), bytes);
+                    ++written;
+                }
+                static u32 reset_logs{};
+                if (reset_logs < 5) {
+                    ++reset_logs;
+                    LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records ({} written)",
+                             list_begin, count, written);
+                }
+            }
+            submitted = true;
+            return;
+        }
+    }
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
@@ -296,6 +481,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
         return;
     }
+    TraceShaderDraw(*pipeline);
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
@@ -595,6 +781,10 @@ void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
+    in_indirect_draw = true;
+    SCOPE_EXIT {
+        in_indirect_draw = false;
+    };
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {
             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
@@ -2088,7 +2278,7 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
         return;
     }
     scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
+        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::DepthComparisonOp(func));
     });
 }
 

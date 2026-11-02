@@ -34,4 +34,11 @@ void ConvertLegacyToGeneric(IR::Program& program, const RuntimeInfo& runtime_inf
                                                       IR::Program& source_program,
                                                       Shader::OutputTopology output_topology);
 
+// A passthrough geometry program forwards only the inputs the host passes through. Give it the
+// per-primitive state the guest hardware forwards as well: the previous stage's layer and
+// viewport index (through a free generic) and, when the fragment program reads it, the
+// primitive id. Returns what was forwarded (bit 0 layer, 1 viewport index, 2 primitive id).
+u32 ForwardPassthroughGeometryState(IR::Program& source, IR::Program& geometry,
+                                    const IR::Program* fragment);
+
 } // namespace Shader::Maxwell

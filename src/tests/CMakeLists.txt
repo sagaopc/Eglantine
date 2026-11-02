@@ -19,7 +19,11 @@ add_executable(tests
     core/core_timing.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/ampere_atexit.cpp
+    video_core/ampere_conversions.cpp
+    video_core/ampere_geometry.cpp
     video_core/ampere_returns.cpp
+    video_core/ampere_uniform_registers.cpp
     input_common/calibration_configuration_job.cpp
 )
 

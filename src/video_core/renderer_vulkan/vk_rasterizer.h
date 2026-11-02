@@ -155,6 +155,7 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
+    void TraceShaderDraw(const GraphicsPipeline& pipeline);
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
 
@@ -230,6 +231,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    bool in_indirect_draw{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 

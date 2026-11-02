@@ -1747,6 +1747,9 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        // The same position math in two programs must rasterize to the same depth (a depth
+        // prepass followed by an EQUAL-tested color pass); only Invariant guarantees that.
+        Decorate(output_position, spv::Decoration::Invariant);
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {
@@ -1782,6 +1785,10 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
             throw NotImplementedException("Storing ViewportIndex in fragment stage");
         }
         viewport_index = DefineOutput(*this, U32[1], invocations, spv::BuiltIn::ViewportIndex);
+    }
+    if (info.stores[IR::Attribute::PrimitiveId] && stage == Stage::Geometry) {
+        // Per-primitive id a passthrough geometry program forwards to the fragment program.
+        primitive_id_out = DefineOutput(*this, U32[1], invocations, spv::BuiltIn::PrimitiveId);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         viewport_mask = DefineOutput(*this, TypeArray(U32[1], Const(1u)), std::nullopt,

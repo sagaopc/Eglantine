@@ -56,6 +56,10 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison);
 
+/// The depth test's comparison. EDEN_NX2_DEPTH_EQUAL_AS_LEQUAL=1 relaxes EQUAL to LESS_OR_EQUAL
+/// (a diagnostic for color passes that must match a depth prepass exactly).
+VkCompareOp DepthComparisonOp(Maxwell::ComparisonOp comparison);
+
 VkIndexType IndexFormat(Maxwell::IndexFormat index_format);
 
 VkStencilOp StencilOp(Maxwell::StencilOp::Op stencil_op);

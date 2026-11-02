@@ -102,6 +102,11 @@ std::optional<OutAttr> OutputAttrPointer(EmitContext& ctx, IR::Attribute attr) {
             return OutAttr{ctx.viewport_index, ctx.U32[1]};
         }
         return std::nullopt;
+    case IR::Attribute::PrimitiveId:
+        if (ctx.stage == Shader::Stage::Geometry && Sirit::ValidId(ctx.primitive_id_out)) {
+            return OutAttr{ctx.primitive_id_out, ctx.U32[1]};
+        }
+        return std::nullopt;
     case IR::Attribute::ViewportMask:
         if (!ctx.profile.support_viewport_mask) {
             return std::nullopt;

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <iterator>
 
 #include "common/assert.h"
@@ -610,6 +611,15 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
 
     return device.GetSupportedFormat(format, VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
                                      FormatType::Buffer);
+}
+
+VkCompareOp DepthComparisonOp(Maxwell::ComparisonOp comparison) {
+    static const bool relax_equal = [] {
+        const char* value = std::getenv("EDEN_NX2_DEPTH_EQUAL_AS_LEQUAL");
+        return value && *value && *value != '0';
+    }();
+    const VkCompareOp op = ComparisonOp(comparison);
+    return relax_equal && op == VK_COMPARE_OP_EQUAL ? VK_COMPARE_OP_LESS_OR_EQUAL : op;
 }
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {

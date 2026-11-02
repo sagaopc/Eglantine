@@ -78,7 +78,7 @@ public:
 protected:
     std::optional<u64> TryFindSize();
 
-    void InitializeNativeCode(u32 source_header_size = 128);
+    void InitializeNativeCode(u32 source_header_size = 128, bool geometry = false);
     size_t native_source_size{};
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
